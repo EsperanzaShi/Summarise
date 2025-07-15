@@ -9,11 +9,13 @@ from torch.utils.data import default_collate
 from peft import LoraConfig, get_peft_model
 import wandb
 import json
+import matplotlib.pyplot as plt
+import numpy as np
 
 MODEL_NAME = "Qwen/Qwen1.5-0.5B"  # Can change to "Qwen3-0.6B-base" when available
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 MAX_LENGTH = 512
-LR = 5e-5  # Conservative LR for LoRA + reward modeling
+LR = 1e-7  # Conservative LR for LoRA + reward modeling
 EPOCHS = 50
 
 wandb.init(
@@ -41,6 +43,12 @@ base_model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True
 )
 
+def init_lora_weights(module):
+    # Initialize LoRA adapter weights with small normal values
+    if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+        nn.init.normal_(module.lora_A.default.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(module.lora_B.default.weight, mean=0.0, std=1e-3)
+
 # LoRA configuration and integration
 lora_config = LoraConfig(
     r=8,                # Rank of LoRA matrices (common values: 4, 8, 16)
@@ -51,13 +59,15 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM"
 )
 base_model = get_peft_model(base_model, lora_config)
+# Apply custom LoRA initialization
+base_model.apply(init_lora_weights)
 
 # Reward model = base + scalar reward head
 class RewardModel(nn.Module):
     def __init__(self, base_model):
         super().__init__()
         self.base_model = base_model
-        self.v_head = nn.Linear(base_model.config.hidden_size, 1, bias=False)
+        self.v_head = nn.Linear(base_model.config.hidden_size, 1, bias=False)  # Set bias=False
         # Ensure v_head is on the same device and dtype as base_model
         self.v_head = self.v_head.to(dtype=base_model.dtype, device=base_model.device)
 
@@ -78,14 +88,14 @@ class RewardModel(nn.Module):
 # Wrap the base model
 model = RewardModel(base_model).to(device)
 
-# Freeze original base model parameters but keep LoRA adapters trainable
+# Freeze original base model parameters but keep LoRA adapters and last 8 transformer blocks trainable
 for name, param in model.base_model.named_parameters():
-    # Freeze original model parameters (not LoRA)
-    if "lora" not in name.lower():
-        param.requires_grad = False
-    else:
-        # Keep LoRA parameters trainable
+    if "lora" in name.lower():
         param.requires_grad = True
+    elif any(f"layers.{i}" in name for i in range(23, 15, -1)):
+        param.requires_grad = True
+    else:
+        param.requires_grad = False
 
 # After model creation, check trainable parameters and LoRA modules
 print("\n--- Trainable Parameters ---")
@@ -117,24 +127,17 @@ for name, module in model.base_model.named_modules():
     print(name, type(module))
 print("-----------------------------\n")
 
-# Load and filter dataset
+# Remove keyword filtering, use full dataset
 full_dataset = load_dataset("Dahoas/full-hh-rlhf", split="train")
-
-def keyword_filter(example):
-    keywords = ["friendship", "relationship", "mental health", "gender identity", "religion and spirituality", "job interview"]
-    combined_text = (example["prompt"] + example["chosen"] + example["rejected"]).lower()
-    return any(kw in combined_text for kw in keywords)
-
-filtered_dataset = full_dataset.filter(keyword_filter)
-
-if len(filtered_dataset) == 0:
-    print("No examples found with the given keywords!")
-    exit()
+filtered_dataset = full_dataset  # No filtering
 
 split_ratio = 0.9
 split = filtered_dataset.train_test_split(test_size=1 - split_ratio)
 train_dataset = split["train"]
 test_dataset = split["test"]
+
+print(f"Number of training samples: {len(train_dataset)}")
+print(f"Number of test samples: {len(test_dataset)}")
 
 # Subset for faster experimentation
 #train_dataset = train_dataset.select(range(1000))
@@ -175,19 +178,21 @@ param_groups = []
 # LoRA parameters - lower LR
 lora_params = [p for name, p in model.named_parameters() if 'lora' in name.lower()]
 if lora_params:
-    param_groups.append({'params': lora_params, 'lr': LR * 0.5})  # 2.5e-5 for LoRA
+    param_groups.append({'params': lora_params, 'lr': LR})  # 1e-5 for LoRA
 
-# v_head parameters - higher LR
+# v_head parameters - lower LR (no multiplier)
 v_head_params = [p for name, p in model.named_parameters() if 'v_head' in name.lower()]
 if v_head_params:
-    param_groups.append({'params': v_head_params, 'lr': LR * 2})  # 1e-4 for v_head
+    param_groups.append({'params': v_head_params, 'lr': LR})  # 2e-5 for v_head
 
-optimizer = AdamW(param_groups)
+optimizer = AdamW(param_groups, weight_decay=0.05)
 
 # --- Early stopping and best model saving setup ---
 best_loss = float('inf')
 epochs_no_improve = 0
 patience = 2  # Stop if no improvement for 2 consecutive epochs
+
+ACCUMULATION_STEPS = 4  # Simulate larger batch size
 
 def ensure_tensor(x):
     if isinstance(x, torch.Tensor):
@@ -199,17 +204,18 @@ def ensure_tensor(x):
 
 # Training Loop
 model.train()
+margin = 0.05  # Smaller margin for weak separation and noisy data
 for epoch in tqdm(range(EPOCHS), desc="Epochs"):
     print(f"Epoch {epoch + 1}/{EPOCHS}")
     epoch_loss = 0
     batch_iter = tqdm(dataloader, desc=f"Epoch {epoch + 1}", leave=False)
-    for batch in batch_iter:
+    optimizer.zero_grad()
+    for step, batch in enumerate(batch_iter):
         chosen_ids = ensure_tensor(batch["chosen_input_ids"]).to(device)
         chosen_mask = ensure_tensor(batch["chosen_attention_mask"]).to(device)
         rejected_ids = ensure_tensor(batch["rejected_input_ids"]).to(device)
         rejected_mask = ensure_tensor(batch["rejected_attention_mask"]).to(device)
 
-        optimizer.zero_grad()
         chosen_rewards = model(chosen_ids, chosen_mask)
         rejected_rewards = model(rejected_ids, rejected_mask)
 
@@ -218,19 +224,28 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
             for i in range(chosen_rewards.shape[0]):
                 print(f"Batch {batch_iter.n} Example {i}: chosen_reward={chosen_rewards[i].item():.4f}, rejected_reward={rejected_rewards[i].item():.4f}, diff={(chosen_rewards[i] - rejected_rewards[i]).item():.4f}")
 
-        # Pairwise logistic loss
-        loss = -torch.log(torch.sigmoid(chosen_rewards - rejected_rewards)).mean()
+        # Pairwise logistic loss with margin
+        loss = -torch.log(torch.sigmoid(chosen_rewards - rejected_rewards - margin)).mean()
+        # L2 penalty on reward outputs
+        l2_lambda = 0.001
+        reward_outputs = torch.cat([chosen_rewards, rejected_rewards])
+        l2_penalty = l2_lambda * (reward_outputs ** 2).mean()
+        loss = loss + l2_penalty
+        loss = loss / ACCUMULATION_STEPS  # Normalize loss for accumulation
         loss.backward()
-        # Print gradients for v_head and LoRA
-        print("--- Gradients after backward() ---")
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                print(f"Grad {name}: mean={param.grad.mean().item():.6f}, std={param.grad.std().item():.6f}")
-        print("-----------------------------\n")
-        optimizer.step()
-
-        epoch_loss += loss.item()
-        batch_iter.set_postfix(loss=loss.item())
+        # Gradient clipping to prevent collapse (clip after accumulation)
+        if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == len(batch_iter):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Print gradients for v_head and LoRA and unfrozen base model layers only
+            print("--- Gradients after backward() ---")
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    print(f"Grad {name}: mean={param.grad.mean().item():.6f}, std={param.grad.std().item():.6f}")
+            print("-----------------------------\n")
+            optimizer.step()
+            optimizer.zero_grad()
+        epoch_loss += loss.item() * ACCUMULATION_STEPS  # Undo normalization for reporting
+        batch_iter.set_postfix(loss=loss.item() * ACCUMULATION_STEPS)
 
     avg_loss = epoch_loss / len(dataloader)
     print(f"Average Training Loss: {avg_loss:.4f}")
@@ -251,8 +266,8 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
             rejected_reward = model(rejected_ids, rejected_mask)
             correct += (chosen_reward > rejected_reward).sum().item()
             total += chosen_reward.size(0)
-            # Compute test loss for early stopping
-            test_loss += -torch.log(torch.sigmoid(chosen_reward - rejected_reward)).mean().item()
+            # Compute test loss for early stopping (with margin)
+            test_loss += -torch.log(torch.sigmoid(chosen_reward - rejected_reward - margin)).mean().item()
     pairwise_acc = correct / total if total > 0 else 0.0
     avg_test_loss = test_loss / len(test_loader)
     print(f"Pairwise Accuracy on Test Set: {pairwise_acc:.4f}")
@@ -290,9 +305,10 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
     else:
         epochs_no_improve += 1
         print(f"No improvement in test loss for {epochs_no_improve} epoch(s). Best loss: {best_loss:.4f}")
-    if epochs_no_improve >= patience:
-        print(f"⏹️ Early stopping: No improvement in test loss for {patience} consecutive epochs.")
-        break
+    # Early stopping is disabled: do not break the loop
+    # if epochs_no_improve >= patience:
+    #     print(f"⏹️ Early stopping: No improvement in test loss for {patience} consecutive epochs.")
+    #     break
 
 # Save model
 torch.save(model.state_dict(), "qwen_reward_model.pt")
@@ -301,7 +317,16 @@ print("✅ Reward model saved as qwen_reward_model.pt")
 # Save LoRA config if used
 if lora_config is not None:
     # Only save serializable fields
+    def make_json_serializable(d):
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, set):
+                out[k] = list(v)
+            else:
+                out[k] = v
+        return out
     lora_config_dict = {k: v for k, v in lora_config.__dict__.items() if not k.startswith('_')}
+    lora_config_dict = make_json_serializable(lora_config_dict)
     with open("lora_config.json", "w") as f:
         json.dump(lora_config_dict, f)
     print("✅ LoRA config saved as lora_config.json")
@@ -310,6 +335,8 @@ if lora_config is not None:
 model.eval()
 test_loader = DataLoader(processed_test, batch_size=1)
 with torch.no_grad():
+    chosen_rewards_list = []
+    rejected_rewards_list = []
     for i, test_batch in enumerate(test_loader):
         if i >= 3:
             break
@@ -338,6 +365,14 @@ with torch.no_grad():
         print(f"CHOSEN REWARD: {chosen_reward:.4f}")
         print(f"REJECTED REWARD: {rejected_reward:.4f}")
         print("---")
+        chosen_rewards_list.append(chosen_reward.cpu().numpy())
+        rejected_rewards_list.append(rejected_reward.cpu().numpy())
+
+plt.hist(np.concatenate(chosen_rewards_list), bins=50, alpha=0.5, label='chosen')
+plt.hist(np.concatenate(rejected_rewards_list), bins=50, alpha=0.5, label='rejected')
+plt.legend()
+plt.title('Reward Distribution')
+plt.show()
 
 test_batch = next(iter(DataLoader(processed_test, batch_size=1)))
 test_ids = ensure_tensor(test_batch["chosen_input_ids"]).to(device)
