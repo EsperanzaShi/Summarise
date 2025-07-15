@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 MODEL_NAME = "Qwen/Qwen1.5-0.5B"  # Can change to "Qwen3-0.6B-base" when available
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 MAX_LENGTH = 512
 LR = 1e-7  # Conservative LR for LoRA + reward modeling
 EPOCHS = 50
@@ -140,8 +140,8 @@ print(f"Number of training samples: {len(train_dataset)}")
 print(f"Number of test samples: {len(test_dataset)}")
 
 # Subset for faster experimentation
-#train_dataset = train_dataset.select(range(1000))
-#test_dataset = test_dataset.select(range(100))
+train_dataset = train_dataset.select(range(50000))
+test_dataset = test_dataset.select(range(1000))
 
 # Preprocessing
 def preprocess(example):
