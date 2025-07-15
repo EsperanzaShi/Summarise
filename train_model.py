@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 MODEL_NAME = "Qwen/Qwen1.5-0.5B"  # Can change to "Qwen3-0.6B-base" when available
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 MAX_LENGTH = 512
 LR = 1e-7  # Conservative LR for LoRA + reward modeling
 EPOCHS = 50
@@ -70,6 +70,7 @@ class RewardModel(nn.Module):
         self.v_head = nn.Linear(base_model.config.hidden_size, 1, bias=False)  # Set bias=False
         # Ensure v_head is on the same device and dtype as base_model
         self.v_head = self.v_head.to(dtype=base_model.dtype, device=base_model.device)
+        nn.init.normal_(self.v_head.weight, mean=0.0, std=1e-4)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.base_model(
@@ -88,14 +89,9 @@ class RewardModel(nn.Module):
 # Wrap the base model
 model = RewardModel(base_model).to(device)
 
-
-# Optionally, to isolate issues, allow switching to training only v_head
-TRAIN_V_HEAD_ONLY = False  # Set to True to isolate reward head
-
+# Freeze original base model parameters but keep LoRA adapters and last 8 transformer blocks trainable
 for name, param in model.base_model.named_parameters():
-    if TRAIN_V_HEAD_ONLY:
-        param.requires_grad = False
-    elif "lora" in name.lower():
+    if "lora" in name.lower():
         param.requires_grad = True
     elif any(f"layers.{i}" in name for i in range(23, 15, -1)):
         param.requires_grad = True
@@ -103,34 +99,34 @@ for name, param in model.base_model.named_parameters():
         param.requires_grad = False
 
 # After model creation, check trainable parameters and LoRA modules
-print("\n--- Trainable Parameters ---")
-trainable_count = 0
-for name, param in model.named_parameters():
-    if param.requires_grad:
-        print(f"Trainable: {name}, shape: {param.shape}")
-        trainable_count += param.numel()
-print(f"Total trainable parameters: {trainable_count:,}")
-print("---------------------------\n")
+# print("\n--- Trainable Parameters ---")
+# trainable_count = 0
+# for name, param in model.named_parameters():
+#     if param.requires_grad:
+#         print(f"Trainable: {name}, shape: {param.shape}")
+#         trainable_count += param.numel()
+# print(f"Total trainable parameters: {trainable_count:,}")
+# print("---------------------------\n")
 
 # List LoRA modules in the model
-print("--- LoRA Modules in Model ---")
-lora_params_count = 0
-for name, module in model.named_modules():
-    if "lora" in name.lower() or "lora" in str(type(module)).lower():
-        print(f"LoRA module: {name}, type: {type(module)}")
-        # Check if this module has trainable parameters
-        for param_name, param in module.named_parameters():
-            if param.requires_grad:
-                print(f"  Trainable LoRA param: {param_name}, shape: {param.shape}")
-                lora_params_count += param.numel()
-print(f"Total trainable LoRA parameters: {lora_params_count:,}")
-print("-----------------------------\n")
+# print("--- LoRA Modules in Model ---")
+# lora_params_count = 0
+# for name, module in model.named_modules():
+#     if "lora" in name.lower() or "lora" in str(type(module)).lower():
+#         print(f"LoRA module: {name}, type: {type(module)}")
+#         # Check if this module has trainable parameters
+#         for param_name, param in module.named_parameters():
+#             if param.requires_grad:
+#                 print(f"  Trainable LoRA param: {param_name}, shape: {param.shape}")
+#                 lora_params_count += param.numel()
+# print(f"Total trainable LoRA parameters: {lora_params_count:,}")
+# print("-----------------------------\n")
 
 # Print all module names to help user check target_modules
-print("--- All Module Names in Base Model ---")
-for name, module in model.base_model.named_modules():
-    print(name, type(module))
-print("-----------------------------\n")
+# print("--- All Module Names in Base Model ---")
+# for name, module in model.base_model.named_modules():
+#     print(name, type(module))
+# print("-----------------------------\n")
 
 # Remove keyword filtering, use full dataset
 full_dataset = load_dataset("Dahoas/full-hh-rlhf", split="train")
@@ -145,8 +141,8 @@ print(f"Number of training samples: {len(train_dataset)}")
 print(f"Number of test samples: {len(test_dataset)}")
 
 # Subset for faster experimentation
-train_dataset = train_dataset.select(range(1000))
-test_dataset = test_dataset.select(range(100))
+train_dataset = train_dataset.select(range(8000))
+test_dataset = test_dataset.select(range(800))
 
 # Preprocessing
 def preprocess(example):
@@ -176,7 +172,7 @@ for i in range(3):
     print("REJECTED:", raw["rejected"])
     print("---")
 
-dataloader = DataLoader(processed_train, batch_size=2, shuffle=True)
+dataloader = DataLoader(processed_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
 # Optimizer with different learning rates for different components
 param_groups = []
@@ -189,12 +185,6 @@ if lora_params:
 v_head_params = [p for name, p in model.named_parameters() if 'v_head' in name.lower()]
 if v_head_params:
     param_groups.append({'params': v_head_params, 'lr': LR})  # 2e-5 for v_head
-
-# Check that all optimizer parameters are trainable
-for group in param_groups:
-    for param in group['params']:
-        if not param.requires_grad:
-            print(f"[WARNING] Optimizer contains frozen param: {param.shape}")
 
 optimizer = AdamW(param_groups, weight_decay=0.05)
 
@@ -232,14 +222,6 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
         chosen_rewards = model(chosen_ids, chosen_mask)
         rejected_rewards = model(rejected_ids, rejected_mask)
 
-        print(f"[Step {step+1}] Chosen mean: {chosen_rewards.mean():.4f}, std: {chosen_rewards.std():.6f}")
-        print(f"[Step {step+1}] Rejected mean: {rejected_rewards.mean():.4f}, std: {rejected_rewards.std():.6f}")
-
-        # Print reward values for debugging (first few batches)
-        if batch_iter.n < 5:  # Only print first 5 batches
-            for i in range(chosen_rewards.shape[0]):
-                print(f"Batch {batch_iter.n} Example {i}: chosen_reward={chosen_rewards[i].item():.4f}, rejected_reward={rejected_rewards[i].item():.4f}, diff={(chosen_rewards[i] - rejected_rewards[i]).item():.4f}")
-
         # Collapse detection: if both chosen and rejected rewards have near-zero variance
         if not collapse_triggered and chosen_rewards.var() < 1e-6 and rejected_rewards.var() < 1e-6:
             print("[WARNING] Model rewards collapsed to a constant value! Lowering LR and increasing L2 penalty.")
@@ -274,8 +256,7 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
             break
         # Gradient clipping to prevent collapse (clip after accumulation)
         if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == len(batch_iter):
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            print(f"[Step {step+1}] Gradient norm after clipping: {total_grad_norm:.4f}")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
         epoch_loss += loss.item() * ACCUMULATION_STEPS  # Undo normalization for reporting
@@ -342,6 +323,10 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
         epochs_no_improve = 0
         torch.save(model.state_dict(), "qwen_reward_model_best.pt")
         print("✅ Best model saved as qwen_reward_model_best.pt")
+        # Upload best model to wandb
+        artifact = wandb.Artifact('best_model', type='model')
+        artifact.add_file('qwen_reward_model_best.pt')
+        wandb.log_artifact(artifact)
     else:
         epochs_no_improve += 1
         print(f"No improvement in test loss for {epochs_no_improve} epoch(s). Best loss: {best_loss:.4f}")
@@ -353,6 +338,10 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
 # Save model
 torch.save(model.state_dict(), "qwen_reward_model.pt")
 print("✅ Reward model saved as qwen_reward_model.pt")
+# Upload final model to wandb
+artifact = wandb.Artifact('final_model', type='model')
+artifact.add_file('qwen_reward_model.pt')
+wandb.log_artifact(artifact)
 
 # Save LoRA config if used
 if lora_config is not None:
@@ -373,7 +362,7 @@ if lora_config is not None:
 
 # After training, print a few examples of chosen/rejected pairs and their rewards
 model.eval()
-test_loader = DataLoader(processed_test, batch_size=1)
+test_loader = DataLoader(processed_test, batch_size=1, num_workers=4)
 with torch.no_grad():
     chosen_rewards_list = []
     rejected_rewards_list = []
