@@ -7,12 +7,27 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from torch.utils.data import default_collate
 from peft import LoraConfig, get_peft_model
+import wandb
+import json
 
-MODEL_NAME = "Qwen/Qwen3-0.6B-base"  # Can change to "Qwen3-0.6B-base" when available
-BATCH_SIZE = 1
-MAX_LENGTH = 256
+MODEL_NAME = "Qwen/Qwen1.5-0.5B"  # Can change to "Qwen3-0.6B-base" when available
+BATCH_SIZE = 4
+MAX_LENGTH = 512
 LR = 5e-5  # Conservative LR for LoRA + reward modeling
-EPOCHS = 5
+EPOCHS = 50
+
+wandb.init(
+    entity="Week6",
+    project="Summarise",  # You can change this project name
+    config={
+        "model_name": MODEL_NAME,
+        "batch_size": BATCH_SIZE,
+        "max_length": MAX_LENGTH,
+        "learning_rate": LR,
+        "epochs": EPOCHS,
+    }
+)
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -169,6 +184,11 @@ if v_head_params:
 
 optimizer = AdamW(param_groups)
 
+# --- Early stopping and best model saving setup ---
+best_loss = float('inf')
+epochs_no_improve = 0
+patience = 2  # Stop if no improvement for 2 consecutive epochs
+
 # Training Loop
 model.train()
 for epoch in tqdm(range(EPOCHS), desc="Epochs"):
@@ -222,6 +242,7 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
     model.eval()
     correct = 0
     total = 0
+    test_loss = 0.0
     test_loader = DataLoader(processed_test, batch_size=1)
     with torch.no_grad():
         for test_batch in test_loader:
@@ -245,13 +266,60 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
             rejected_reward = model(rejected_ids, rejected_mask)
             correct += (chosen_reward > rejected_reward).sum().item()
             total += chosen_reward.size(0)
+            # Compute test loss for early stopping
+            test_loss += -torch.log(torch.sigmoid(chosen_reward - rejected_reward)).mean().item()
     pairwise_acc = correct / total if total > 0 else 0.0
+    avg_test_loss = test_loss / len(test_loader)
     print(f"Pairwise Accuracy on Test Set: {pairwise_acc:.4f}")
+    print(f"Average Test Loss: {avg_test_loss:.4f}")
     model.train()
+
+    # Log v_head.weight gradient mean and std (from last batch of epoch)
+    v_head_grad = None
+    for name, param in model.named_parameters():
+        if param.requires_grad and "v_head.weight" in name and param.grad is not None:
+            v_head_grad = param.grad
+            break
+    if v_head_grad is not None:
+        v_head_grad_mean = v_head_grad.mean().item()
+        v_head_grad_std = v_head_grad.std().item()
+    else:
+        v_head_grad_mean = None
+        v_head_grad_std = None
+
+    wandb.log({
+        "train_loss": avg_loss,
+        "pairwise_accuracy": pairwise_acc,
+        "test_loss": avg_test_loss,
+        "v_head_grad_mean": v_head_grad_mean,
+        "v_head_grad_std": v_head_grad_std,
+        "epoch": epoch + 1,
+    })
+
+    # --- Loss-based Early Stopping ---
+    if avg_test_loss < best_loss:
+        best_loss = avg_test_loss
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), "qwen_reward_model_best.pt")
+        print("✅ Best model saved as qwen_reward_model_best.pt")
+    else:
+        epochs_no_improve += 1
+        print(f"No improvement in test loss for {epochs_no_improve} epoch(s). Best loss: {best_loss:.4f}")
+    if epochs_no_improve >= patience:
+        print(f"⏹️ Early stopping: No improvement in test loss for {patience} consecutive epochs.")
+        break
 
 # Save model
 torch.save(model.state_dict(), "qwen_reward_model.pt")
 print("✅ Reward model saved as qwen_reward_model.pt")
+
+# Save LoRA config if used
+if lora_config is not None:
+    # Only save serializable fields
+    lora_config_dict = {k: v for k, v in lora_config.__dict__.items() if not k.startswith('_')}
+    with open("lora_config.json", "w") as f:
+        json.dump(lora_config_dict, f)
+    print("✅ LoRA config saved as lora_config.json")
 
 # After training, print a few examples of chosen/rejected pairs and their rewards
 model.eval()
@@ -310,3 +378,31 @@ test_mask = test_mask.to(device)
 with torch.no_grad():
     rewards = model(test_ids, test_mask)
 print("Test batch rewards:", rewards)
+
+
+wandb.finish()
+
+# --- Reward Model Loader Wrapper ---
+def load_reward_model(model_path, base_model_name, lora_config_path=None, device="cpu"):
+    """
+    Loads the reward model with base, v_head, and LoRA config (if provided).
+    """
+    from transformers import AutoModelForCausalLM
+    from peft import get_peft_model, LoraConfig
+    import torch
+    import json
+
+    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, trust_remote_code=True)
+    if lora_config_path is not None:
+        with open(lora_config_path, "r") as f:
+            lora_cfg_dict = json.load(f)
+        lora_cfg = LoraConfig(**lora_cfg_dict)
+        base_model = get_peft_model(base_model, lora_cfg)
+    model = RewardModel(base_model)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+    return model
+
+# Example usage (uncomment to test):
+# reward_model = load_reward_model("qwen_reward_model_best.pt", "Qwen/Qwen1.5-0.5B", "lora_config.json", device="cuda")
