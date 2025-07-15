@@ -1,0 +1,25 @@
+[project]
+name = "summarise"
+version = "0.1.0"
+description = "Reward model training for Qwen3-0.6B-base"
+authors = [
+    { name = "Your Name", email = "your@email.com" }
+]
+requires-python = ">=3.8"
+
+dependencies = [
+    "torch",
+    "transformers",
+    "datasets",
+    "tqdm",
+    "accelerate"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff"
+]
+
+[tool.uv]
