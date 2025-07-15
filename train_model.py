@@ -15,7 +15,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 MODEL_NAME = "Qwen/Qwen1.5-0.5B"  # Can change to "Qwen3-0.6B-base" when available
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 MAX_LENGTH = 512
 LR = 1e-7  # Conservative LR for LoRA + reward modeling
 EPOCHS = 50
