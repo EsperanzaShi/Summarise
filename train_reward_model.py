@@ -236,17 +236,17 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
         # Gradient clipping to prevent collapse (clip after accumulation)
         if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == len(batch_iter):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            # Print gradients for v_head and LoRA and unfrozen base model layers only
-            print("--- Gradients after backward() ---")
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    print(f"Grad {name}: mean={param.grad.mean().item():.6f}, std={param.grad.std().item():.6f}")
-            print("-----------------------------\n")
             optimizer.step()
             optimizer.zero_grad()
         epoch_loss += loss.item() * ACCUMULATION_STEPS  # Undo normalization for reporting
         batch_iter.set_postfix(loss=loss.item() * ACCUMULATION_STEPS)
 
+    # Print gradients for v_head and LoRA and unfrozen base model layers only ONCE per epoch
+    print("--- Gradients after epoch backward() ---")
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            print(f"Grad {name}: mean={param.grad.mean().item():.6f}, std={param.grad.std().item():.6f}")
+    print("-----------------------------\n")
     avg_loss = epoch_loss / len(dataloader)
     print(f"Average Training Loss: {avg_loss:.4f}")
 
