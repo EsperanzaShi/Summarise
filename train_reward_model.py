@@ -121,7 +121,7 @@ print("-----------------------------\n")
 full_dataset = load_dataset("Dahoas/full-hh-rlhf", split="train")
 
 def keyword_filter(example):
-    keywords = ["friendship", "relationship", "mental health"]
+    keywords = ["friendship", "relationship", "mental health", "gender identity", "religion and spirituality", "job interview"]
     combined_text = (example["prompt"] + example["chosen"] + example["rejected"]).lower()
     return any(kw in combined_text for kw in keywords)
 
@@ -137,8 +137,8 @@ train_dataset = split["train"]
 test_dataset = split["test"]
 
 # Subset for faster experimentation
-train_dataset = train_dataset.select(range(1000))
-test_dataset = test_dataset.select(range(100))
+#train_dataset = train_dataset.select(range(1000))
+#test_dataset = test_dataset.select(range(100))
 
 # Preprocessing
 def preprocess(example):
@@ -189,6 +189,14 @@ best_loss = float('inf')
 epochs_no_improve = 0
 patience = 2  # Stop if no improvement for 2 consecutive epochs
 
+def ensure_tensor(x):
+    if isinstance(x, torch.Tensor):
+        return x
+    # If x is a list of tensors, stack them
+    if isinstance(x, list) and len(x) > 0 and isinstance(x[0], torch.Tensor):
+        return torch.stack(x)
+    return torch.tensor(x)
+
 # Training Loop
 model.train()
 for epoch in tqdm(range(EPOCHS), desc="Epochs"):
@@ -196,22 +204,10 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
     epoch_loss = 0
     batch_iter = tqdm(dataloader, desc=f"Epoch {epoch + 1}", leave=False)
     for batch in batch_iter:
-        chosen_ids = torch.tensor(batch["chosen_input_ids"])
-        if chosen_ids.dim() == 1:
-            chosen_ids = chosen_ids.unsqueeze(0)
-        chosen_ids = chosen_ids.to(device)
-        chosen_mask = torch.tensor(batch["chosen_attention_mask"])
-        if chosen_mask.dim() == 1:
-            chosen_mask = chosen_mask.unsqueeze(0)
-        chosen_mask = chosen_mask.to(device)
-        rejected_ids = torch.tensor(batch["rejected_input_ids"])
-        if rejected_ids.dim() == 1:
-            rejected_ids = rejected_ids.unsqueeze(0)
-        rejected_ids = rejected_ids.to(device)
-        rejected_mask = torch.tensor(batch["rejected_attention_mask"])
-        if rejected_mask.dim() == 1:
-            rejected_mask = rejected_mask.unsqueeze(0)
-        rejected_mask = rejected_mask.to(device)
+        chosen_ids = ensure_tensor(batch["chosen_input_ids"]).to(device)
+        chosen_mask = ensure_tensor(batch["chosen_attention_mask"]).to(device)
+        rejected_ids = ensure_tensor(batch["rejected_input_ids"]).to(device)
+        rejected_mask = ensure_tensor(batch["rejected_attention_mask"]).to(device)
 
         optimizer.zero_grad()
         chosen_rewards = model(chosen_ids, chosen_mask)
@@ -219,7 +215,8 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
 
         # Print reward values for debugging (first few batches)
         if batch_iter.n < 5:  # Only print first 5 batches
-            print(f"Batch {batch_iter.n}: chosen_reward={chosen_rewards.item():.4f}, rejected_reward={rejected_rewards.item():.4f}, diff={chosen_rewards.item() - rejected_rewards.item():.4f}")
+            for i in range(chosen_rewards.shape[0]):
+                print(f"Batch {batch_iter.n} Example {i}: chosen_reward={chosen_rewards[i].item():.4f}, rejected_reward={rejected_rewards[i].item():.4f}, diff={(chosen_rewards[i] - rejected_rewards[i]).item():.4f}")
 
         # Pairwise logistic loss
         loss = -torch.log(torch.sigmoid(chosen_rewards - rejected_rewards)).mean()
@@ -246,22 +243,10 @@ for epoch in tqdm(range(EPOCHS), desc="Epochs"):
     test_loader = DataLoader(processed_test, batch_size=1)
     with torch.no_grad():
         for test_batch in test_loader:
-            chosen_ids = torch.tensor(test_batch["chosen_input_ids"])
-            if chosen_ids.dim() == 1:
-                chosen_ids = chosen_ids.unsqueeze(0)
-            chosen_ids = chosen_ids.to(device)
-            chosen_mask = torch.tensor(test_batch["chosen_attention_mask"])
-            if chosen_mask.dim() == 1:
-                chosen_mask = chosen_mask.unsqueeze(0)
-            chosen_mask = chosen_mask.to(device)
-            rejected_ids = torch.tensor(test_batch["rejected_input_ids"])
-            if rejected_ids.dim() == 1:
-                rejected_ids = rejected_ids.unsqueeze(0)
-            rejected_ids = rejected_ids.to(device)
-            rejected_mask = torch.tensor(test_batch["rejected_attention_mask"])
-            if rejected_mask.dim() == 1:
-                rejected_mask = rejected_mask.unsqueeze(0)
-            rejected_mask = rejected_mask.to(device)
+            chosen_ids = ensure_tensor(test_batch["chosen_input_ids"]).to(device)
+            chosen_mask = ensure_tensor(test_batch["chosen_attention_mask"]).to(device)
+            rejected_ids = ensure_tensor(test_batch["rejected_input_ids"]).to(device)
+            rejected_mask = ensure_tensor(test_batch["rejected_attention_mask"]).to(device)
             chosen_reward = model(chosen_ids, chosen_mask)
             rejected_reward = model(rejected_ids, rejected_mask)
             correct += (chosen_reward > rejected_reward).sum().item()
@@ -328,22 +313,10 @@ with torch.no_grad():
     for i, test_batch in enumerate(test_loader):
         if i >= 3:
             break
-        chosen_ids = torch.tensor(test_batch["chosen_input_ids"])
-        if chosen_ids.dim() == 1:
-            chosen_ids = chosen_ids.unsqueeze(0)
-        chosen_ids = chosen_ids.to(device)
-        chosen_mask = torch.tensor(test_batch["chosen_attention_mask"])
-        if chosen_mask.dim() == 1:
-            chosen_mask = chosen_mask.unsqueeze(0)
-        chosen_mask = chosen_mask.to(device)
-        rejected_ids = torch.tensor(test_batch["rejected_input_ids"])
-        if rejected_ids.dim() == 1:
-            rejected_ids = rejected_ids.unsqueeze(0)
-        rejected_ids = rejected_ids.to(device)
-        rejected_mask = torch.tensor(test_batch["rejected_attention_mask"])
-        if rejected_mask.dim() == 1:
-            rejected_mask = rejected_mask.unsqueeze(0)
-        rejected_mask = rejected_mask.to(device)
+        chosen_ids = ensure_tensor(test_batch["chosen_input_ids"]).to(device)
+        chosen_mask = ensure_tensor(test_batch["chosen_attention_mask"]).to(device)
+        rejected_ids = ensure_tensor(test_batch["rejected_input_ids"]).to(device)
+        rejected_mask = ensure_tensor(test_batch["rejected_attention_mask"]).to(device)
         chosen_reward = model(chosen_ids, chosen_mask)
         rejected_reward = model(rejected_ids, rejected_mask)
         # Robust scalar extraction
@@ -367,14 +340,8 @@ with torch.no_grad():
         print("---")
 
 test_batch = next(iter(DataLoader(processed_test, batch_size=1)))
-test_ids = torch.tensor(test_batch["chosen_input_ids"])
-if test_ids.dim() == 1:
-    test_ids = test_ids.unsqueeze(0)
-test_ids = test_ids.to(device)
-test_mask = torch.tensor(test_batch["chosen_attention_mask"])
-if test_mask.dim() == 1:
-    test_mask = test_mask.unsqueeze(0)
-test_mask = test_mask.to(device)
+test_ids = ensure_tensor(test_batch["chosen_input_ids"]).to(device)
+test_mask = ensure_tensor(test_batch["chosen_attention_mask"]).to(device)
 with torch.no_grad():
     rewards = model(test_ids, test_mask)
 print("Test batch rewards:", rewards)
