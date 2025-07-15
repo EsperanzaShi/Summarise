@@ -172,7 +172,7 @@ for i in range(3):
     print("REJECTED:", raw["rejected"])
     print("---")
 
-dataloader = DataLoader(processed_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+dataloader = DataLoader(processed_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=1)
 
 # Optimizer with different learning rates for different components
 param_groups = []
@@ -362,7 +362,7 @@ if lora_config is not None:
 
 # After training, print a few examples of chosen/rejected pairs and their rewards
 model.eval()
-test_loader = DataLoader(processed_test, batch_size=1, num_workers=4)
+test_loader = DataLoader(processed_test, batch_size=1, num_workers=1)
 with torch.no_grad():
     chosen_rewards_list = []
     rejected_rewards_list = []
