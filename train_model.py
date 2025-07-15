@@ -11,6 +11,8 @@ import wandb
 import json
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 MODEL_NAME = "Qwen/Qwen1.5-0.5B"  # Can change to "Qwen3-0.6B-base" when available
 BATCH_SIZE = 16
@@ -172,7 +174,7 @@ for i in range(3):
     print("REJECTED:", raw["rejected"])
     print("---")
 
-dataloader = DataLoader(processed_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=1)
+dataloader = DataLoader(processed_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
 # Optimizer with different learning rates for different components
 param_groups = []
